@@ -54,6 +54,8 @@ _CAPNP_VERSION_MINOR = capnp.CAPNP_VERSION_MINOR
 _CAPNP_VERSION_MICRO = capnp.CAPNP_VERSION_MICRO
 _CAPNP_VERSION = capnp.CAPNP_VERSION
 
+cdef char _EMPTY_DATA_VIEW_SENTINEL = 0
+
 cdef dict _type_registry = {}
 
 
@@ -1292,11 +1294,21 @@ cdef class _DynamicStructReader:
         return self.thisptr.hasByField(field.thisptr)
 
     cpdef get_data_as_view(self, field):
-        """
-        Efficiently get a read-only memoryview for a DATA field without copying.
+        """Efficiently get a read-only memoryview for a DATA field without copying.
+
+        .. warning::
+            The returned memoryview *borrows* memory owned by this message. It stays valid only
+            while both the memoryview (and any object derived from it) and this reader are alive;
+            the reader keeps the underlying message buffer pinned for that duration. Do not let
+            the message be mutated underneath an outstanding view.
+
+        An unset/empty DATA field yields a valid, zero-length view (it does not raise).
         """
         cdef C_DynamicValue.Reader val
         cdef capnp.Data.Reader temp_data
+        cdef Py_buffer buf
+        cdef void* data_ptr
+        cdef size_t data_size
 
         try:
             val = self.thisptr.get(field)
@@ -1307,12 +1319,22 @@ cdef class _DynamicStructReader:
             raise TypeError("Field '{}' is not a DATA field".format(field))
 
         temp_data = val.asData()
+        data_ptr = <void*>temp_data.begin()
+        data_size = temp_data.size()
+
+        if data_size == 0 and data_ptr == NULL:
+            data_ptr = <void*>&_EMPTY_DATA_VIEW_SENTINEL
 
         # Return read-only memoryview
-        cdef Py_buffer buf
-        if PyBuffer_FillInfo(&buf, self, <void*>temp_data.begin(), temp_data.size(), 1, PyBUF_CONTIG_RO) < 0:
+        if PyBuffer_FillInfo(&buf, self, data_ptr, data_size, 1, PyBUF_CONTIG_RO) < 0:
             raise KjException("Failed to create buffer info")
-        return PyMemoryView_FromBuffer(&buf)
+        # PyBuffer_FillInfo took a reference to `self` via buf.obj. If building the memoryview
+        # fails, release it so we don't leak that reference.
+        try:
+            return PyMemoryView_FromBuffer(&buf)
+        except:
+            PyBuffer_Release(&buf)
+            raise
 
     cpdef _which_str(self):
         try:
@@ -1531,8 +1553,21 @@ cdef class _DynamicStructBuilder:
     cpdef to_segment_views(_DynamicStructBuilder self):
         """Returns the struct's containing message as zero-copy, read-only segment views.
 
-        The returned views borrow memory from the message builder. Do not mutate, reset, or reuse
-        the builder while the views are still in use.
+        The returned object is a sequence of read-only buffer-protocol views, one per output
+        segment. Each view borrows memory owned by the message builder; the segment pointers and
+        sizes are captured eagerly at call time (a snapshot).
+
+        .. warning::
+            The views (and any buffer exported from them, e.g. by ``memoryview()`` or by a
+            consumer that holds them) keep the builder pinned and remain valid only while no
+            mutation happens. Do NOT mutate, re-set, reset, or reuse the builder while any view or
+            exported buffer is still alive -- this includes calls that may allocate (e.g. getting
+            an unset pointer/struct/list field). Mutating after the snapshot can grow/relocate
+            segments, leaving the views pointing at stale or truncated data. Sharing the views
+            across threads or ``await`` points while the builder may change is a data race.
+
+            Lifetime is enforced only by buffer-protocol reference counting (memory is not freed
+            while a view is held); correctness of the *contents* is the caller's responsibility.
 
         :rtype: sequence
         """
@@ -1731,14 +1766,28 @@ cdef class _DynamicStructBuilder:
         return _DynamicOrphan()._init(self.thisptr.disown(field), self._parent)
 
     cpdef get_data_as_view(self, field):
-        """
-        Efficiently get a writable memoryview for a DATA field without copying.
+        """Efficiently get a writable memoryview for a DATA field without copying.
 
-        This allows in-place modification of the underlying buffer:
-        msg.get_data_as_view('myField')[0] = 0xFF
+        This allows in-place modification of the underlying buffer::
+
+            msg.get_data_as_view('myField')[0] = 0xFF
+
+        .. warning::
+            The returned memoryview *borrows* mutable memory owned by this message builder. It is
+            only valid while both the memoryview (and any object derived from it) and this builder
+            are alive. Do NOT mutate, re-set, reset, or reuse the builder while a view is
+            outstanding -- including calls that may allocate (e.g. getting an unset pointer/struct/
+            list field), since those can relocate or stale the borrowed memory. Sharing a view
+            across threads or ``await`` points while the builder may change is a data race.
+
+        An unset/empty DATA field yields a valid but zero-length view (writes are no-ops); to write
+        into the field, initialize it to the desired size first.
         """
         cdef C_DynamicValue.Builder val
         cdef capnp.Data.Builder temp_data
+        cdef Py_buffer buf
+        cdef void* data_ptr
+        cdef size_t data_size
 
         try:
             val = self.thisptr.get(field)
@@ -1749,12 +1798,22 @@ cdef class _DynamicStructBuilder:
             raise TypeError("Field '{}' is not a DATA field".format(field))
 
         temp_data = val.asData()
+        data_ptr = <void*>temp_data.begin()
+        data_size = temp_data.size()
+
+        if data_size == 0 and data_ptr == NULL:
+            data_ptr = <void*>&_EMPTY_DATA_VIEW_SENTINEL
 
         # Return writable memoryview
-        cdef Py_buffer buf
-        if PyBuffer_FillInfo(&buf, self, <void*>temp_data.begin(), temp_data.size(), 0, PyBUF_WRITABLE) < 0:
+        if PyBuffer_FillInfo(&buf, self, data_ptr, data_size, 0, PyBUF_WRITABLE) < 0:
             raise KjException("Failed to create buffer info")
-        return PyMemoryView_FromBuffer(&buf)
+        # PyBuffer_FillInfo took a reference to `self` via buf.obj. If building the memoryview
+        # fails, release it so we don't leak that reference.
+        try:
+            return PyMemoryView_FromBuffer(&buf)
+        except:
+            PyBuffer_Release(&buf)
+            raise
 
     cpdef as_reader(self):
         """A method for casting this Builder to a Reader
