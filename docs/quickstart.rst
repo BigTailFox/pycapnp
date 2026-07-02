@@ -320,8 +320,16 @@ There is serialization to a byte string available::
 
 And a corresponding from_bytes function::
 
+    alice = addressbook_capnp.Person.from_bytes(encoded_message)
+
+The returned reader keeps the input buffer alive. ``from_bytes()`` can also be
+used as a context manager when an exported buffer, such as a ``memoryview`` or
+``mmap``, must be released deterministically::
+
     with addressbook_capnp.Person.from_bytes(encoded_message) as alice:
-        # something with alice
+        # use alice within this block
+
+The reader must not be used after leaving the context.
 
 There are also packed versions::
 

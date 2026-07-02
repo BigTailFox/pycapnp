@@ -47,8 +47,55 @@ def test_roundtrip_bytes(all_types):
     test_regression.init_all_types(msg)
     message_bytes = msg.to_bytes()
 
-    with all_types.TestAllTypes.from_bytes(message_bytes) as msg:
-        test_regression.check_all_types(msg)
+    msg = all_types.TestAllTypes.from_bytes(message_bytes)
+    test_regression.check_all_types(msg)
+
+
+def test_from_bytes_context_manager_releases_buffer(all_types):
+    msg = all_types.TestAllTypes.new_message()
+    test_regression.init_all_types(msg)
+    message_bytes = bytearray(msg.to_bytes())
+
+    with all_types.TestAllTypes.from_bytes(message_bytes) as reader:
+        test_regression.check_all_types(reader)
+        with pytest.raises(BufferError):
+            message_bytes.extend(b"\0" * 8)
+
+    message_bytes.extend(b"\0" * 8)
+
+
+def test_from_bytes_reader_keeps_buffer_pinned(all_types):
+    msg = all_types.TestAllTypes.new_message()
+    test_regression.init_all_types(msg)
+    message_bytes = bytearray(msg.to_bytes())
+
+    reader = all_types.TestAllTypes.from_bytes(message_bytes)
+    test_regression.check_all_types(reader)
+    with pytest.raises(BufferError):
+        message_bytes.extend(b"\0" * 8)
+
+    del reader
+    gc.collect()
+    message_bytes.extend(b"\0" * 8)
+
+
+def test_from_bytes_builder_without_context_manager(all_types):
+    msg = all_types.TestAllTypes.new_message()
+    test_regression.init_all_types(msg)
+    message_bytes = bytearray(msg.to_bytes())
+
+    builder = all_types.TestAllTypes.from_bytes(message_bytes, builder=True)
+    test_regression.check_all_types(builder)
+    message_bytes.extend(b"\0" * 8)
+
+
+def test_from_bytes_builder_context_manager(all_types):
+    msg = all_types.TestAllTypes.new_message()
+    test_regression.init_all_types(msg)
+    message_bytes = msg.to_bytes()
+
+    with all_types.TestAllTypes.from_bytes(message_bytes, builder=True) as builder:
+        test_regression.check_all_types(builder)
 
 
 @pytest.mark.skipif(

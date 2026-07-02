@@ -28,9 +28,8 @@ from libcpp.utility cimport move
 
 import array
 import asyncio
-import collections as _collections
-import contextlib
 import base64
+import collections as _collections
 import enum as _enum
 import inspect as _inspect
 import os as _os
@@ -1273,6 +1272,15 @@ cdef class _DynamicStructReader:
                 return registered_type[0](self)
         return self
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        close = getattr(self._parent, "close", None)
+        if close is not None:
+            close()
+        return False
+
     cpdef _get(self, field):
         ptr = self.thisptr.get(field)
         return to_python_reader(ptr, self)
@@ -1455,6 +1463,12 @@ cdef class _DynamicStructBuilder:
             if registered_type:
                 return registered_type[1](self)
         return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
 
     cdef _check_write(self):
         if not self.is_root:
@@ -3576,7 +3590,6 @@ class _StructModule(object):
         reader = _MultipleBytesPackedMessageReader(buf, self.schema, traversal_limit_in_words, nesting_limit)
         return reader
 
-    @contextlib.contextmanager
     def from_bytes(self, buf, traversal_limit_in_words=None, nesting_limit=None, builder=False):
         """Returns a Reader for the unpacked object in buf.
 
@@ -3591,24 +3604,27 @@ class _StructModule(object):
         :param nesting_limit: Limits how many total words of data are allowed to be traversed. Default is 64.
 
         :type builder: bool
-        :param builder: If true, return a builder object.
+        :param builder: If true, return a builder copied from the input buffer.
 
-        Enabling `builder` will allow you to change the contents of `buf`, so do this with care.
+        The returned reader keeps the input buffer alive until the reader is
+        destroyed. This method can also be used as a context manager to release
+        exported buffers deterministically; the reader must not be used after
+        leaving the context.
 
         :rtype: :class:`_DynamicStructReader` or :class:`_DynamicStructBuilder`
         """
-        message = None
+        message = _FlatArrayMessageReader(buf, traversal_limit_in_words, nesting_limit)
         try:
-            if builder:
-                # message = _FlatMessageBuilder(buf)
-                message = _FlatArrayMessageReader(buf, traversal_limit_in_words, nesting_limit)
-                yield message.get_root(self.schema).as_builder()
-            else:
-                message = _FlatArrayMessageReader(buf, traversal_limit_in_words, nesting_limit)
-                yield message.get_root(self.schema)
-        finally:
-            if message:
+            root = message.get_root(self.schema)
+        except:
+            message.close()
+            raise
+        if builder:
+            try:
+                return root.as_builder()
+            finally:
                 message.close()
+        return root
 
     def from_segments(self, segments, traversal_limit_in_words=None, nesting_limit=None):
         """Returns a Reader for a list of segment bytes.
