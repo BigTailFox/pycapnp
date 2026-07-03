@@ -290,8 +290,8 @@ cdef api object wrap_kj_exception(capnp.Exception & exception) with gil:
 
 
 cdef api object wrap_kj_exception_for_reraise(capnp.Exception & exception) with gil:
+    PyErr_Clear()
     wrapper = _KjExceptionWrapper()._init(exception)
-
     ret = KjException(wrapper=wrapper)
     return ret
 
@@ -2471,7 +2471,9 @@ cdef class _DynamicCapabilityClient:
 
         self._set_fields(request, name, args, kwargs)
 
-        return _RemotePromise()._init(request.send(), self)
+        cdef _RemotePromise result = _RemotePromise()._init(request.send(), self)
+        del request
+        return result
 
     cpdef _request_helper(self, name, firstSegmentWordSize, args, kwargs):
         # if word_count is None:
