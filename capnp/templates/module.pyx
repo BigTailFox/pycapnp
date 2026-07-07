@@ -40,7 +40,11 @@ cpdef _get_{{field.name}}(self):
     return (<char*>temp.begin())[:temp.size()]
     {% elif 'data' == field['type'] -%}
     temp = self.thisptr_child.get{{field.c_name}}()
-    return <bytes>((<char*>temp.begin())[:temp.size()])
+    {% if type == "Reader" -%}
+    return _view_from_data_ptr(self, <void*>temp.begin(), temp.size(), True)
+    {% else -%}
+    return _view_from_data_ptr(self, <void*>temp.begin(), temp.size(), False)
+    {% endif -%}
     {% else -%}
     cdef DynamicValue.{{type}} temp = self.thisptr_child.get{{field.c_name}}()
     return to_python_{{type | lower}}(temp, self._parent)
@@ -113,7 +117,7 @@ import {{file.filename | replace('.', '_')}}
 from capnp.includes.types cimport *
 from capnp cimport helpers
 from capnp.includes.capnp_cpp cimport DynamicValue, Schema, VOID, StringPtr, ArrayPtr, Data
-from capnp.lib.capnp cimport _DynamicStructReader, _DynamicStructBuilder, _DynamicListBuilder, _DynamicEnum, _StructSchemaField, to_python_builder, to_python_reader, _to_dict, _setDynamicFieldStatic, _Schema, _InterfaceSchema
+from capnp.lib.capnp cimport _DynamicStructReader, _DynamicStructBuilder, _DynamicListBuilder, _DynamicEnum, _StructSchemaField, to_python_builder, to_python_reader, _to_dict, _setDynamicFieldStatic, _Schema, _InterfaceSchema, _view_from_data_ptr
 
 from capnp.helpers.non_circular cimport reraise_kj_exception
 

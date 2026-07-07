@@ -671,7 +671,8 @@ cdef to_python_reader(C_DynamicValue.Reader self, object parent):
         return (<char*>temp_text.begin())[:temp_text.size()]
     elif type == capnp.TYPE_DATA:
         temp_data = self.asData()
-        return <bytes>((<char*>temp_data.begin())[:temp_data.size()])
+        return _view_from_data_ptr(
+            parent, <void*>temp_data.begin(), temp_data.size(), True)
     elif type == capnp.TYPE_LIST:
         return _DynamicListReader()._init(self.asList(), parent)
     elif type == capnp.TYPE_STRUCT:
@@ -705,7 +706,8 @@ cdef to_python_builder(C_DynamicValue.Builder self, object parent):
         return (<char*>temp_text.begin())[:temp_text.size()]
     elif type == capnp.TYPE_DATA:
         temp_data = self.asData()
-        return <bytes>((<char*>temp_data.begin())[:temp_data.size()])
+        return _view_from_data_ptr(
+            parent, <void*>temp_data.begin(), temp_data.size(), False)
     elif type == capnp.TYPE_LIST:
         return _DynamicListBuilder()._init(self.asList(), parent)
     elif type == capnp.TYPE_STRUCT:
@@ -1213,6 +1215,13 @@ cdef inline object _memoryview_borrowing(object owner, void* ptr, Py_ssize_t siz
     cdef _BorrowedBufferView exporter
     exporter = _BorrowedBufferView()._init(owner, ptr, size, readonly)
     return PyMemoryView_FromObject(exporter)
+
+
+cdef inline object _view_from_data_ptr(object owner, void* data_ptr, size_t data_size,
+                                       bint readonly):
+    if data_size == 0 and data_ptr == NULL:
+        data_ptr = <void*>&_EMPTY_DATA_VIEW_SENTINEL
+    return _memoryview_borrowing(owner, data_ptr, <Py_ssize_t>data_size, readonly)
 
 
 cdef void _data_field_ptr_reader(_DynamicStructReader self, field,

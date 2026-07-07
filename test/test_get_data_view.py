@@ -18,8 +18,8 @@ def all_types():
 
 def test_set_bytes_get_bytes(all_types):
     """
-    Scenario 1: Set Byte -> Get Byte
-    Verify standard behavior: writing bytes results in reading bytes.
+    Scenario 1: Set Byte -> Get memoryview
+    Verify standard behavior: writing bytes results in a zero-copy memoryview.
     """
     msg = all_types.TestAllTypes.new_message()
     input_data = b"hello_world"
@@ -31,15 +31,15 @@ def test_set_bytes_get_bytes(all_types):
     output_data = msg.dataField
 
     # Verify
-    assert isinstance(output_data, bytes)
-    assert output_data == input_data
+    assert isinstance(output_data, memoryview)
+    assert output_data.tobytes() == input_data
 
 
 def test_set_view_get_bytes(all_types):
     """
-    Scenario 2: Set View -> Get Byte
+    Scenario 2: Set View -> Get memoryview
     Verify compatibility: Passing a memoryview sets the data,
-    but standard attribute access returns a bytes copy.
+    and standard attribute access returns a memoryview view of the message buffer.
     """
     msg = all_types.TestAllTypes.new_message()
 
@@ -54,8 +54,8 @@ def test_set_view_get_bytes(all_types):
     output_data = msg.dataField
 
     # Verify
-    assert isinstance(output_data, bytes)
-    assert output_data == b"view_source"
+    assert isinstance(output_data, memoryview)
+    assert output_data.tobytes() == b"view_source"
 
 
 def test_set_bytes_get_view_and_modify(all_types):
@@ -81,7 +81,7 @@ def test_set_bytes_get_view_and_modify(all_types):
     view[0] = ord("Z")  # Change 'A' to 'Z'
 
     # Verify modification is reflected in standard access
-    assert msg.dataField == b"ZBCDE"
+    assert msg.dataField.tobytes() == b"ZBCDE"
 
 
 def test_reader_vs_builder_view(all_types):
@@ -100,7 +100,7 @@ def test_reader_vs_builder_view(all_types):
     reader = builder.as_reader()
 
     # Standard Get
-    assert reader.dataField == b"Test_rw"
+    assert reader.dataField.tobytes() == b"Test_rw"
 
     # Reader get_data_as_view
     reader_view = reader.get_data_as_view("dataField")
@@ -124,7 +124,7 @@ def test_nested_struct_data(all_types):
     inner.dataField = b"nested_data"
 
     # 1. Verify standard access
-    assert msg.structField.dataField == b"nested_data"
+    assert msg.structField.dataField.tobytes() == b"nested_data"
 
     # 2. Verify nested get_data_as_view
     view = msg.structField.get_data_as_view("dataField")
@@ -134,7 +134,7 @@ def test_nested_struct_data(all_types):
 
     # Modify nested data
     view[0] = ord("N")
-    assert msg.structField.dataField == b"Nested_data"
+    assert msg.structField.dataField.tobytes() == b"Nested_data"
 
 
 def test_corner_cases_values(all_types):
@@ -145,14 +145,14 @@ def test_corner_cases_values(all_types):
 
     # Case A: Empty Bytes
     msg.dataField = b""
-    assert msg.dataField == b""
+    assert msg.dataField.tobytes() == b""
     view = msg.get_data_as_view("dataField")
     assert len(view) == 0
 
     # Case B: Binary data containing null bytes
     binary_data = b"\x00\xff\x00\x01"
     msg.dataField = binary_data
-    assert msg.dataField == binary_data
+    assert msg.dataField.tobytes() == binary_data
     assert msg.get_data_as_view("dataField").tobytes() == binary_data
 
 
