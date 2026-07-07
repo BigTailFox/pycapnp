@@ -195,6 +195,7 @@ extensions = [
         "*",
         [
             "capnp/helpers/capabilityHelper.cpp",
+            "capnp/helpers/primitiveListBuffer.cpp",
             "capnp/includes/PyCustomMessageBuilder.cpp",
             "capnp/lib/*.pyx",
         ],

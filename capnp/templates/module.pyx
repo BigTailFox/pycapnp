@@ -45,6 +45,8 @@ cpdef _get_{{field.name}}(self):
     {% else -%}
     return _view_from_data_ptr(self, <void*>temp.begin(), temp.size(), False)
     {% endif -%}
+    {% elif 'list' == field['type'] -%}
+    return self._get("{{field.name}}")
     {% else -%}
     cdef DynamicValue.{{type}} temp = self.thisptr_child.get{{field.c_name}}()
     return to_python_{{type | lower}}(temp, self._parent)
@@ -76,6 +78,18 @@ cpdef _set_{{field.name}}(self, value=None):
 cpdef _set_{{field.name}}(self, cbool value):
     self.thisptr_child.set{{field.c_name}}(value)
     {% elif 'list' == field['type'] -%}
+    {% if field['sub_type'] and ('int8' in field['sub_type'] or 'int16' in field['sub_type'] or 'int32' in field['sub_type'] or 'int64' in field['sub_type'] or 'uInt8' in field['sub_type'] or 'uInt16' in field['sub_type'] or 'uInt32' in field['sub_type'] or 'uInt64' in field['sub_type'] or 'float32' in field['sub_type'] or 'float64' in field['sub_type']) -%}
+cpdef _set_{{field.name}}(self, object value):
+    if _try_set_typed_primitive_list_from_buffer(self, "{{field.name}}", value):
+        return
+    if type(value) is not list:
+        raise TypeError("Expected list for field '{{field.name}}'")
+    cdef uint i = 0
+    cdef _DynamicListBuilder temp =  self.init("{{field.name}}", len(value))
+    for elem in value:
+        temp[i] = elem
+        i += 1
+    {% else -%}
 cpdef _set_{{field.name}}(self, list value):
     cdef uint i = 0
     self.init("{{field.name}}", len(value))
@@ -87,6 +101,7 @@ cpdef _set_{{field.name}}(self, list value):
         temp[i] = elem
         {% endif -%}
         i += 1
+    {% endif -%}
     {% elif 'text' == field['type'] -%}
 cpdef _set_{{field.name}}(self, value):
     cdef StringPtr temp_string
@@ -117,7 +132,7 @@ import {{file.filename | replace('.', '_')}}
 from capnp.includes.types cimport *
 from capnp cimport helpers
 from capnp.includes.capnp_cpp cimport DynamicValue, Schema, VOID, StringPtr, ArrayPtr, Data
-from capnp.lib.capnp cimport _DynamicStructReader, _DynamicStructBuilder, _DynamicListBuilder, _DynamicEnum, _StructSchemaField, to_python_builder, to_python_reader, _to_dict, _setDynamicFieldStatic, _Schema, _InterfaceSchema, _view_from_data_ptr
+from capnp.lib.capnp cimport _DynamicStructReader, _DynamicStructBuilder, _DynamicListBuilder, _DynamicEnum, _StructSchemaField, to_python_builder, to_python_reader, _to_dict, _setDynamicFieldStatic, _Schema, _InterfaceSchema, _view_from_data_ptr, _try_set_typed_primitive_list_from_buffer
 
 from capnp.helpers.non_circular cimport reraise_kj_exception
 

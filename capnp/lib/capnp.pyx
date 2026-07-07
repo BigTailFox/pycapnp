@@ -15,14 +15,14 @@ from capnp.includes.schema_cpp cimport (MessageReader,)
 
 from builtins import memoryview as BuiltinsMemoryview
 from cpython cimport array, Py_buffer, PyObject_CheckBuffer
-from cpython.buffer cimport PyBUF_SIMPLE, PyBUF_WRITABLE, PyBUF_WRITE, PyBUF_READ, PyBUF_CONTIG_RO, PyBuffer_FillInfo
+from cpython.buffer cimport PyBUF_SIMPLE, PyBUF_WRITABLE, PyBUF_WRITE, PyBUF_READ, PyBUF_CONTIG_RO, PyBUF_FORMAT, PyBuffer_FillInfo
 from cpython.memoryview cimport PyMemoryView_FromMemory, PyMemoryView_FromObject
 from cpython.bytes cimport PyBytes_FromStringAndSize
 from cpython.exc cimport PyErr_Clear
 from cpython.pyport cimport PY_SSIZE_T_MAX
 from cython.operator cimport dereference as deref
 from libc.stdlib cimport malloc, free
-from libc.string cimport memcpy
+from libc.string cimport memcpy, strcmp
 from libcpp.utility cimport move
 
 
@@ -332,6 +332,31 @@ cdef extern from "Python.h":
     cdef int PyObject_GetBuffer(object, Py_buffer *view, int flags)
     cdef void PyBuffer_Release(Py_buffer *view)
 
+cdef extern from "capnp/helpers/primitiveListBuffer.h" namespace "pycapnp":
+    cdef struct PrimitiveListElementInfo:
+        size_t elementSize
+        const char* format
+        bint eligible
+
+    PrimitiveListElementInfo getPrimitiveListElementInfo(capnp.SchemaType elementType)
+    bint getPrimitiveListReaderBuffer(
+        C_DynamicList.Reader list,
+        capnp.SchemaType elementType,
+        const void** outPtr,
+        size_t* outByteLen,
+        size_t* outElementCount)
+    bint getPrimitiveListBuilderBuffer(
+        C_DynamicList.Builder list,
+        capnp.SchemaType elementType,
+        void** outPtr,
+        size_t* outByteLen,
+        size_t* outElementCount)
+    bint setPrimitiveListBuilderFromBuffer(
+        C_DynamicList.Builder list,
+        capnp.SchemaType elementType,
+        const void* src,
+        size_t srcByteLen)
+
 # Templated classes are weird in cython. I couldn't put it in a pxd header for some reason
 cdef extern from "capnp/list.h" namespace " ::capnp":
     cdef cppclass List[T]:
@@ -628,6 +653,184 @@ cdef class _DynamicListBuilder:
         return '<capnp list builder %s>' % <char*>strListBuilder(self.thisptr).cStr()
 
 
+cdef class _PrimitiveScalarListView:
+    """Buffer-protocol view over an eligible primitive Cap'n Proto list."""
+    cdef object __weakref__
+    cdef object _owner
+    cdef C_DynamicList.Reader _reader
+    cdef C_DynamicList.Builder _builder
+    cdef bint _readonly
+    cdef const char* _ptr
+    cdef Py_ssize_t _byte_size
+    cdef Py_ssize_t _element_count
+    cdef Py_ssize_t _element_size
+    cdef const char* _format
+    cdef Py_ssize_t _shape[1]
+    cdef Py_ssize_t _strides[1]
+
+    cdef _set_metadata(self, object owner, const void* ptr, size_t byte_size,
+                       size_t element_count, PrimitiveListElementInfo info,
+                       bint readonly):
+        if byte_size > <size_t>PY_SSIZE_T_MAX:
+            raise OverflowError("primitive list is too large to expose as a Python buffer")
+        if element_count > <size_t>PY_SSIZE_T_MAX:
+            raise OverflowError("primitive list is too large to expose as a Python sequence")
+        if info.elementSize > <size_t>PY_SSIZE_T_MAX:
+            raise OverflowError("primitive list element size is too large")
+
+        self._owner = owner
+        self._ptr = <const char*>ptr
+        self._byte_size = <Py_ssize_t>byte_size
+        self._element_count = <Py_ssize_t>element_count
+        self._element_size = <Py_ssize_t>info.elementSize
+        self._format = info.format
+        self._shape[0] = self._element_count
+        self._strides[0] = self._element_size
+        self._readonly = readonly
+        return self
+
+    cdef _init_reader(self, C_DynamicList.Reader other, object owner,
+                      capnp.SchemaType element_type):
+        cdef PrimitiveListElementInfo info
+        cdef const void* ptr
+        cdef size_t byte_size
+        cdef size_t element_count
+
+        info = getPrimitiveListElementInfo(element_type)
+        if not info.eligible:
+            raise TypeError("list element type does not support buffer export")
+        if not getPrimitiveListReaderBuffer(other, element_type, &ptr, &byte_size, &element_count):
+            raise BufferError("primitive list storage cannot be exposed as a buffer")
+
+        self._reader = other
+        return self._set_metadata(owner, ptr, byte_size, element_count, info, True)
+
+    cdef _init_builder(self, C_DynamicList.Builder other, object owner,
+                       capnp.SchemaType element_type):
+        cdef PrimitiveListElementInfo info
+        cdef void* ptr
+        cdef size_t byte_size
+        cdef size_t element_count
+
+        info = getPrimitiveListElementInfo(element_type)
+        if not info.eligible:
+            raise TypeError("list element type does not support buffer export")
+        if not getPrimitiveListBuilderBuffer(other, element_type, &ptr, &byte_size, &element_count):
+            raise BufferError("primitive list storage cannot be exposed as a buffer")
+
+        self._builder = other
+        return self._set_metadata(owner, ptr, byte_size, element_count, info, False)
+
+    cpdef _get(self, int64_t index):
+        cdef C_DynamicValue.Reader reader_ptr
+        cdef C_DynamicValue.Builder builder_ptr
+
+        if index < 0:
+            index += self._element_count
+        if index < 0 or index >= self._element_count:
+            raise IndexError('Out of bounds')
+
+        if self._readonly:
+            reader_ptr = self._reader[<uint>index]
+            return to_python_reader(reader_ptr, self._owner)
+        else:
+            builder_ptr = self._builder[<uint>index]
+            return to_python_builder(builder_ptr, self._owner)
+
+    def __getbuffer__(self, Py_buffer *buffer, int flags):
+        cdef void* ptr = <void*>self._ptr
+        if self._byte_size == 0 and ptr == NULL:
+            ptr = <void*>&_EMPTY_DATA_VIEW_SENTINEL
+
+        if PyBuffer_FillInfo(buffer, self, ptr, self._byte_size,
+                             self._readonly, flags) < 0:
+            raise BufferError("Failed to create primitive list buffer view")
+
+        buffer.itemsize = self._element_size
+        buffer.format = <char*>self._format
+        buffer.ndim = 1
+        buffer.shape = self._shape
+        buffer.strides = self._strides
+        buffer.suboffsets = NULL
+
+    def __releasebuffer__(self, Py_buffer *buffer):
+        pass
+
+    def __getitem__(self, int64_t index):
+        return self._get(index)
+
+    cpdef _set(self, int64_t index, value):
+        cdef uint size = <uint>self._element_count
+
+        if self._readonly:
+            raise TypeError("Cannot assign to a read-only primitive list view")
+        if index >= size:
+            raise IndexError('Out of bounds')
+        index = index % size
+        _setDynamicField(self._builder, index, value, self._owner)
+
+    def __setitem__(self, int64_t index, value):
+        self._set(index, value)
+
+    def __len__(self):
+        return self._element_count
+
+    def __repr__(self):
+        if self._readonly:
+            return '<capnp primitive list view format=%s count=%d read-only>' % (
+                <char*>self._format, self._element_count)
+        return '<capnp primitive list view format=%s count=%d writable>' % (
+            <char*>self._format, self._element_count)
+
+
+cdef object _try_primitive_list_reader_view(C_DynamicList.Reader list,
+                                            object parent,
+                                            capnp.SchemaType field_type):
+    cdef capnp.SchemaType element_type
+    cdef PrimitiveListElementInfo info
+    if not field_type.isList():
+        return None
+    element_type = field_type.asList().getElementType()
+    info = getPrimitiveListElementInfo(element_type)
+    if not info.eligible:
+        return None
+    return _PrimitiveScalarListView()._init_reader(list, parent, element_type)
+
+
+cdef object _try_primitive_list_builder_view(C_DynamicList.Builder list,
+                                             object parent,
+                                             capnp.SchemaType field_type):
+    cdef capnp.SchemaType element_type
+    cdef PrimitiveListElementInfo info
+    if not field_type.isList():
+        return None
+    element_type = field_type.asList().getElementType()
+    info = getPrimitiveListElementInfo(element_type)
+    if not info.eligible:
+        return None
+    return _PrimitiveScalarListView()._init_builder(list, parent, element_type)
+
+
+cdef to_python_reader_with_type(C_DynamicValue.Reader self, object parent,
+                                capnp.SchemaType field_type):
+    cdef object view
+    if self.getType() == capnp.TYPE_LIST:
+        view = _try_primitive_list_reader_view(self.asList(), parent, field_type)
+        if view is not None:
+            return view
+    return to_python_reader(self, parent)
+
+
+cdef to_python_builder_with_type(C_DynamicValue.Builder self, object parent,
+                                 capnp.SchemaType field_type):
+    cdef object view
+    if self.getType() == capnp.TYPE_LIST:
+        view = _try_primitive_list_builder_view(self.asList(), parent, field_type)
+        if view is not None:
+            return view
+    return to_python_builder(self, parent)
+
+
 cdef class _List_NestedNode_Reader:
     cdef C_Node.NestedNode.Reader.ListNestedNodeReader thisptr
     cdef _init(self, List[C_Node.NestedNode].Reader other):
@@ -742,6 +945,12 @@ cdef C_DynamicValue.Reader _extract_dynamic_list_reader(_DynamicListReader value
     return C_DynamicValue.Reader(value.thisptr)
 
 
+cdef C_DynamicValue.Reader _extract_primitive_list_view(_PrimitiveScalarListView value):
+    if value._readonly:
+        return C_DynamicValue.Reader(value._reader)
+    return C_DynamicValue.Reader(value._builder.asReader())
+
+
 cdef C_DynamicValue.Reader _extract_dynamic_client(_DynamicCapabilityClient value):
     return C_DynamicValue.Reader(value.thisptr)
 
@@ -821,6 +1030,104 @@ cdef _setBaseStringField(DynamicStruct_Builder thisptr, _StructSchemaField field
     thisptr.setByField(field.thisptr, temp)
 
 
+cdef bint _buffer_matches_primitive_list(Py_buffer* buf,
+                                         PrimitiveListElementInfo info) except -1:
+    if buf.len < 0:
+        return False
+    if info.elementSize == 0:
+        return False
+    if (<size_t>buf.len) % info.elementSize != 0:
+        return False
+    if buf.itemsize != 0 and <size_t>buf.itemsize != info.elementSize:
+        return False
+    if buf.format != NULL and info.format != NULL:
+        if strcmp(buf.format, info.format) == 0:
+            return True
+        if info.format[0] == '<' and buf.format[0] == info.format[1] and buf.format[1] == 0:
+            return True
+        if info.format[0] == '<' and buf.format[0] == '=' and buf.format[1] == info.format[1] and buf.format[2] == 0:
+            return True
+        return False
+    return True
+
+
+cdef bint _try_set_primitive_list_from_buffer_core(
+        DynamicStruct_Builder thisptr,
+        capnp.SchemaType field_type,
+        value,
+        object field,
+        bint init_by_field) except -1:
+    cdef Py_buffer buf
+    cdef capnp.SchemaType element_type
+    cdef PrimitiveListElementInfo info
+    cdef size_t count
+    cdef C_DynamicValue.Builder ptr
+    cdef C_DynamicList.Builder builder
+    cdef bint acquired = False
+
+    if not field_type.isList():
+        return False
+
+    element_type = field_type.asList().getElementType()
+    info = getPrimitiveListElementInfo(element_type)
+    if not info.eligible:
+        return False
+    if not PyObject_CheckBuffer(value):
+        return False
+    if PyObject_GetBuffer(value, &buf, PyBUF_CONTIG_RO | PyBUF_FORMAT) != 0:
+        PyErr_Clear()
+        return False
+
+    acquired = True
+    try:
+        if not _buffer_matches_primitive_list(&buf, info):
+            return False
+        count = (<size_t>buf.len) // info.elementSize
+        if count > <size_t>0xffffffff:
+            return False
+
+        if init_by_field:
+            ptr = thisptr.initByField((<_StructSchemaField>field).thisptr, <uint>count)
+        else:
+            ptr = thisptr.init(field, <uint>count)
+        builder = ptr.asList()
+        if not setPrimitiveListBuilderFromBuffer(
+                builder, element_type, <const void*>buf.buf, <size_t>buf.len):
+            raise BufferError("failed to copy primitive list buffer into message")
+        return True
+    finally:
+        if acquired:
+            PyBuffer_Release(&buf)
+
+
+cdef bint _try_set_primitive_list_from_buffer_by_type(
+        DynamicStruct_Builder thisptr, field, capnp.SchemaType field_type,
+        value) except -1:
+    return _try_set_primitive_list_from_buffer_core(
+        thisptr, field_type, value, field, False)
+
+
+cdef bint _try_set_primitive_list_from_buffer(DynamicStruct_Builder thisptr,
+                                             field, value) except -1:
+    cdef capnp.SchemaType field_type
+    if not PyObject_CheckBuffer(value):
+        return False
+    field_type = thisptr.getSchema().getFieldByName(field).getType()
+    return _try_set_primitive_list_from_buffer_by_type(
+        thisptr, field, field_type, value)
+
+
+cdef bint _try_set_primitive_list_from_buffer_by_field(
+        DynamicStruct_Builder thisptr, _StructSchemaField field, value) except -1:
+    return _try_set_primitive_list_from_buffer_core(
+        thisptr, field.thisptr.getType(), value, field, True)
+
+
+cdef bint _try_set_typed_primitive_list_from_buffer(_DynamicStructBuilder msg,
+                                                    field, value) except -1:
+    return _try_set_primitive_list_from_buffer(msg.thisptr, field, value)
+
+
 cdef _setDynamicField(_DynamicSetterClasses thisptr, field, value, parent):
     cdef C_DynamicValue.Reader temp
     value_type = type(value)
@@ -837,6 +1144,8 @@ cdef _setDynamicField(_DynamicSetterClasses thisptr, field, value, parent):
     elif value_type is bool:
         temp = C_DynamicValue.Reader(<cbool>value)
         thisptr.set(field, temp)
+    elif _DynamicSetterClasses is DynamicStruct_Builder and _try_set_primitive_list_from_buffer(thisptr, field, value):
+        return
     elif value_type is bytes:
         _setBytes(thisptr, field, value)
     elif isinstance(value, BuiltinsMemoryview):
@@ -867,6 +1176,8 @@ cdef _setDynamicField(_DynamicSetterClasses thisptr, field, value, parent):
         thisptr.set(field, _extract_dynamic_struct_builder(value))
     elif value_type is _DynamicStructReader:
         thisptr.set(field, _extract_dynamic_struct_reader(value))
+    elif value_type is _PrimitiveScalarListView:
+        thisptr.set(field, _extract_primitive_list_view(value))
     elif value_type is _DynamicListBuilder:
         thisptr.set(field, _extract_dynamic_list_builder(value))
     elif value_type is _DynamicListReader:
@@ -904,6 +1215,8 @@ cdef _setDynamicFieldWithField(DynamicStruct_Builder thisptr, _StructSchemaField
     elif value_type is bool:
         temp = C_DynamicValue.Reader(<cbool>value)
         thisptr.setByField(field.thisptr, temp)
+    elif _try_set_primitive_list_from_buffer_by_field(thisptr, field, value):
+        return
     elif value_type is bytes:
         _setBytesField(thisptr, field, value)
     elif isinstance(value, BuiltinsMemoryview):
@@ -925,6 +1238,8 @@ cdef _setDynamicFieldWithField(DynamicStruct_Builder thisptr, _StructSchemaField
         thisptr.setByField(field.thisptr, _extract_dynamic_struct_builder(value))
     elif value_type is _DynamicStructReader:
         thisptr.setByField(field.thisptr, _extract_dynamic_struct_reader(value))
+    elif value_type is _PrimitiveScalarListView:
+        thisptr.setByField(field.thisptr, _extract_primitive_list_view(value))
     elif value_type is _DynamicListBuilder:
         thisptr.setByField(field.thisptr, _extract_dynamic_list_builder(value))
     elif value_type is _DynamicListReader:
@@ -962,6 +1277,8 @@ cdef _setDynamicFieldStatic(DynamicStruct_Builder thisptr, field, value, parent)
     elif value_type is bool:
         temp = C_DynamicValue.Reader(<cbool>value)
         thisptr.set(field, temp)
+    elif _try_set_primitive_list_from_buffer(thisptr, field, value):
+        return
     elif value_type is bytes:
         _setBytes(thisptr, field, value)
     elif isinstance(value, basestring):
@@ -981,6 +1298,8 @@ cdef _setDynamicFieldStatic(DynamicStruct_Builder thisptr, field, value, parent)
         thisptr.set(field, _extract_dynamic_struct_builder(value))
     elif value_type is _DynamicStructReader:
         thisptr.set(field, _extract_dynamic_struct_reader(value))
+    elif value_type is _PrimitiveScalarListView:
+        thisptr.set(field, _extract_primitive_list_view(value))
     elif value_type is _DynamicListBuilder:
         thisptr.set(field, _extract_dynamic_list_builder(value))
     elif value_type is _DynamicListReader:
@@ -1003,6 +1322,7 @@ cdef _setDynamicFieldStatic(DynamicStruct_Builder thisptr, field, value, parent)
 
 cdef _DynamicListBuilder temp_list_b
 cdef _DynamicListReader temp_list_r
+cdef _PrimitiveScalarListView temp_primitive_list
 cdef _DynamicResizableListBuilder temp_list_rb
 cdef _DynamicStructBuilder temp_msg_b
 cdef _DynamicStructReader temp_msg_r
@@ -1016,6 +1336,12 @@ cdef _to_dict(msg, bint verbose, bint ordered, bint encode_bytes_as_base64=False
     elif msg_type is _DynamicListReader:
         temp_list_r = msg
         return [_to_dict(temp_list_r._get(i), verbose, ordered, encode_bytes_as_base64) for i in range(len(msg))]
+    elif msg_type is _PrimitiveScalarListView:
+        temp_primitive_list = msg
+        return [
+            _to_dict(temp_primitive_list._get(i), verbose, ordered, encode_bytes_as_base64)
+            for i in range(len(msg))
+        ]
     elif msg_type is _DynamicResizableListBuilder:
         temp_list_rb = msg
         return [_to_dict(temp_list_rb._get(i), verbose, ordered, encode_bytes_as_base64) for i in range(len(msg))]
@@ -1345,8 +1671,10 @@ cdef class _DynamicStructReader:
         return False
 
     cpdef _get(self, field):
+        cdef capnp.SchemaType field_type
         ptr = self.thisptr.get(field)
-        return to_python_reader(ptr, self)
+        field_type = self.thisptr.getSchema().getFieldByName(field).getType()
+        return to_python_reader_with_type(ptr, self, field_type)
 
     def __getattr__(self, field):
         try:
@@ -1356,7 +1684,7 @@ cdef class _DynamicStructReader:
 
     cpdef _get_by_field(self, _StructSchemaField field):
         ptr = self.thisptr.getByField(field.thisptr)
-        return to_python_reader(ptr, self)
+        return to_python_reader_with_type(ptr, self, field.thisptr.getType())
 
     cpdef _has(self, field):
         return self.thisptr.has(field)
@@ -1650,12 +1978,14 @@ cdef class _DynamicStructBuilder:
         return ret
 
     cpdef _get(self, field):
+        cdef capnp.SchemaType field_type
         ptr = self.thisptr.get(field)
-        return to_python_builder(ptr, self._parent)
+        field_type = self.thisptr.getSchema().getFieldByName(field).getType()
+        return to_python_builder_with_type(ptr, self._parent, field_type)
 
     cpdef _get_by_field(self, _StructSchemaField field):
         ptr = self.thisptr.getByField(field.thisptr)
-        return to_python_builder(ptr, self._parent)
+        return to_python_builder_with_type(ptr, self._parent, field.thisptr.getType())
 
     def __getattr__(self, field):
         try:

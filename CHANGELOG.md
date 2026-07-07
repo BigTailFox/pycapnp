@@ -1,4 +1,9 @@
 ## v2.2.4 (2026-07-03)
+- Add buffer-protocol fast paths for eligible primitive `List(T)` fields.
+  Eligible numeric list fields now return `_PrimitiveScalarListView` instead of
+  `_DynamicListReader` / `_DynamicListBuilder`. Use `memoryview(...)` or
+  `isinstance(x, capnp._PrimitiveScalarListView)` rather than concrete list
+  wrapper checks; list assignment from another view is supported.
 - Fix memory leak in `_DynamicCapabilityClient._send_helper()` (#398)
 - Fix SIGSEGV (NULL pointer dereference) on malformed Text field
 - Update default bundled capnproto to 1.4.0

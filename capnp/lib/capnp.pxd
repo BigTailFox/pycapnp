@@ -162,6 +162,7 @@ cdef _from_list(_DynamicListBuilder msg, list d)
 cdef _from_tuple(_DynamicListBuilder msg, tuple d)
 cdef _setDynamicFieldWithField(DynamicStruct_Builder thisptr, _StructSchemaField field, value, parent)
 cdef _setDynamicFieldStatic(DynamicStruct_Builder thisptr, field, value, parent)
+cdef bint _try_set_typed_primitive_list_from_buffer(_DynamicStructBuilder msg, field, value) except -1
 cdef inline object _view_from_data_ptr(object owner, void* data_ptr, size_t data_size, bint readonly)
 
 cdef api object wrap_dynamic_struct_reader(Response & r) with gil

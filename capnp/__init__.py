@@ -47,6 +47,7 @@ from .lib.capnp import (
     _InterfaceModule,
     _ListSchema,
     _MallocMessageBuilder,
+    _PrimitiveScalarListView,
     _PyCustomMessageBuilder,
     _PackedFdMessageReader,
     _StreamFdMessageReader,
